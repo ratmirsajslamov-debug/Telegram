@@ -6,13 +6,15 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = "8731906672:AAGDHrBZNvzhaLkzBoqy56gEcNLAWjLxWWo"
 ADMIN_IDS = [1928686265] 
 OWNER_USERNAME = "@exp1d" 
 
-bot = Bot(token=BOT_TOKEN)
+session = AiohttpSession(proxy="http://proxy.server:3128")
+bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
 
 # === СОСТОЯНИЯ ===
@@ -370,16 +372,16 @@ async def del_booster_id(message: types.Message, state: FSMContext):
 
 # === НАСТРОЙКА ВЕБХУКОВ ЧЕРЕЗ FLASK ===
 from flask import Flask, request, abort
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # Инициализация базы данных при запуске приложения
 init_db()
 conn = sqlite3.connect('bot_database.db')
 cursor = conn.cursor()
-cursor.execute("INSERT OR IGNORE INTO boosters (user_id, username) VALUES (1928686265, '@exp1d')") #[cite: 7]
+cursor.execute("INSERT OR IGNORE INTO boosters (user_id, username) VALUES (1928686265, '@exp1d')")
 conn.commit()
 conn.close()
 
-# Создаем приложение Flask, которое ожидает WSGI-сервер
 app = Flask(__name__)
 
 @app.route('/', methods=['POST'])
@@ -387,11 +389,21 @@ def webhook_handler():
     # Telegram отправляет обновления в формате JSON
     if request.headers.get('content-type') == 'application/json':
         json_data = request.json
-        # Преобразуем JSON в объект Update, понятный aiogram
         update = types.Update(**json_data)
-        # Передаем обновление в диспетчер бота
-        asyncio.run(dp.feed_update(bot, update))
+        
+        async def process_update():
+            # Создаем новую сессию с прокси специально внутри живого цикла
+            session = AiohttpSession(proxy="http://proxy.server:3128")
+            # Подменяем мертвую сессию глобального бота на свежую
+            bot.session = session
+            try:
+                await dp.feed_update(bot, update)
+            finally:
+                # Безопасно закрываем соединения
+                await session.close()
+        
+        # Запускаем нашу асинхронную функцию
+        asyncio.run(process_update())
         return 'OK'
     
-    # Если запрос пришел не в JSON, отклоняем его
     abort(403)
