@@ -15,7 +15,20 @@ OWNER_USERNAME = "@exp1d"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# === БАЗА ДАННЫХ (SQLite) ===
+# === СОСТОЯНИЯ ===
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_price_text = State()
+    waiting_for_booster_id = State()
+    waiting_for_booster_username = State()
+    waiting_for_del_booster_id = State()
+
+class OrderStates(StatesGroup):
+    waiting_for_payment = State()
+    waiting_for_game_id = State()
+    waiting_for_confirmation = State()
+
+# === БАЗА ДАННЫХ ===
 def init_db():
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
@@ -24,6 +37,41 @@ def init_db():
                         user_id INTEGER PRIMARY KEY, 
                         username TEXT, 
                         status TEXT DEFAULT '🟢 Свободен')''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+    
+    default_rank = (
+        "⚡️ <b>Прайс на буст звания:</b>\n\n"
+        "🥈 Bronze - Silver: 25₽\n"
+        "🏅 Bronze - Gold: 75₽\n"
+        "🐥 Bronze - Phoenix: 150₽\n"
+        "🔫 Bronze - Ranger: 200₽\n"
+        "🏆 Bronze - Champion: 360₽\n"
+        "🥋 Bronze - Master: 400₽\n"
+        "⚜️ Bronze - Elite: 600₽\n"
+        "🌏 Bronze - Legend: 1000₽"
+    )
+    default_silver = "⚡️ <b>Прайс за буст/фарм серебра:</b>\n\n🪙 1.000 Серебра — 200₽"
+    default_level = "⚡️ <b>Прайс за буст уровня:</b>\n\n📶 1 Уровень — 10₽"
+    
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('price_rank', ?)", (default_rank,))
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('price_silver', ?)", (default_silver,))
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('price_level', ?)", (default_level,))
+    
+    conn.commit()
+    conn.close()
+
+def get_setting(key):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] if res else "Текст не установлен."
+
+def set_setting(key, value):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE settings SET value = ? WHERE key = ?", (value, key))
     conn.commit()
     conn.close()
 
@@ -33,6 +81,14 @@ def add_user(user_id):
     cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
     conn.commit()
     conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    res = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in res]
 
 def get_boosters():
     conn = sqlite3.connect('bot_database.db')
@@ -54,8 +110,8 @@ def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🛒 Выбрать услугу", callback_data="services")],
         [InlineKeyboardButton(text="🕘 Занятость бустеров", callback_data="boosters_status")],
-        [InlineKeyboardButton(text="📄 Правила и требования", callback_data="rules"),
-         InlineKeyboardButton(text="🤝 Поддержка / Отзывы", callback_data="support")]
+        [InlineKeyboardButton(text="📄 Правила и Соглашение", callback_data="rules"),
+         InlineKeyboardButton(text="🤝 Поддержка", callback_data="support")]
     ])
 
 def services_menu_kb():
@@ -66,17 +122,18 @@ def services_menu_kb():
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
     ])
 
-def checkout_kb(service_name):
+def order_payment_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, всё верно", callback_data=f"pay_{service_name}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="services")]
+        [InlineKeyboardButton(text="👤 Напрямую через Владельца", callback_data="paym_Direct")],
+        [InlineKeyboardButton(text="💳 FunPay", callback_data="paym_FunPay")],
+        [InlineKeyboardButton(text="🎮 Playerok", callback_data="paym_Playerok")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_order")]
     ])
 
-def payment_methods_kb():
+def final_confirm_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👤 Напрямую через Владельца", callback_data="pay_direct")],
-        [InlineKeyboardButton(text="💳 Платформа FunPay", callback_data="pay_funpay")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="services")]
+        [InlineKeyboardButton(text="✅ Заказать", callback_data="submit_order")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_order")]
     ])
 
 def booster_panel_kb():
@@ -85,166 +142,237 @@ def booster_panel_kb():
         [InlineKeyboardButton(text="🔴 Поставить статус 'Занят'", callback_data="status_busy")]
     ])
 
-# === КЛИЕНТСКАЯ ЧАСТЬ ===
+def admin_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Управление ценами", callback_data="admin_prices")],
+        [InlineKeyboardButton(text="👥 Управление бустерами", callback_data="admin_boosters")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
+    ])
 
+# === КЛИЕНТСКИЕ КОМАНДЫ ===
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     add_user(message.from_user.id)
-    text = (
-        "Привет! Добро пожаловать в официальный бот DG | Boost Standoff ⚡️\n\n"
-        "Здесь ты можешь быстро заказать буст звания, уровня или серебра, "
-        "проверить занятость наших бустеров и оформить заказ в пару кликов!\n\n"
-        "Навигация по кнопкам ниже 👇"
-    )
-    await message.answer(text, reply_markup=main_menu_kb())
+    await message.answer("Привет! Добро пожаловать в официальный бот DG | Boost Standoff ⚡️\nЗдесь ты можешь оформить заказ в пару кликов!", reply_markup=main_menu_kb())
 
 @dp.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: types.CallbackQuery):
-    text = "Главное меню. Навигация по кнопкам ниже 👇"
-    await callback.message.edit_text(text, reply_markup=main_menu_kb())
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Главное меню 👇", reply_markup=main_menu_kb())
 
-@dp.callback_query(F.data ==
-
-
-"services")
+@dp.callback_query(F.data == "services")
 async def show_services(callback: types.CallbackQuery):
     await callback.message.edit_text("Выберите категорию услуг:", reply_markup=services_menu_kb())
 
 @dp.callback_query(F.data == "boost_rank")
 async def show_rank_prices(callback: types.CallbackQuery):
-    text = (
-        "⚡️ Прайс на буст звания (Действует акция до 28 сентября!):\n\n"
-        "🥈 Bronze - Silver: ~50₽~ 25₽\n"
-        "🏅 Bronze - Gold: ~150₽~ 75₽\n"
-        "🐥 Bronze - Phoenix: ~300₽~ 150₽\n"
-        "🔫 Bronze - Ranger: ~400₽~ 200₽\n"
-        "🏆 Bronze - Champion: ~720₽~ 360₽\n"
-        "🥋 Bronze - Master: ~800₽~ 400₽\n"
-        "⚜️ Bronze - Elite: ~1200₽~ 600₽\n"
-        "🌏 Bronze - Legend: ~2000₽~ 1000₽\n\n"
-        "Выберите нужное звание для оформления заказа (или нажмите Далее для подтверждения):"
-    )
+    text = get_setting('price_rank')
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Перейти к оформлению", callback_data="confirm_Rank")],
+        [InlineKeyboardButton(text="Создать заказ", callback_data="confirm_Звания")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="services")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="MarkdownV2")
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "boost_silver")
 async def show_silver_prices(callback: types.CallbackQuery):
-    text = "⚡️ Прайс за буст/фарм серебра:\n\n🪙 1.000 Серебра — 200₽"
+    text = get_setting('price_silver')
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Заказать серебро", callback_data="confirm_Silver")],
+        [InlineKeyboardButton(text="Создать заказ", callback_data="confirm_Серебра")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="services")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "boost_level")
 async def show_level_prices(callback: types.CallbackQuery):
-    text = (
-        "⚡️ Прайс за буст уровня:\n\n"
-        "📶 1 Уровень — 10₽\n\n"
-        "(Цена может измениться в зависимости от текущего уровня. При заказе от 300₽ — "
-        "прокачка уровня до рейтинговых игр в подарок!)"
-    )
+    text = get_setting('price_level')
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📶 Заказать уровень", callback_data="confirm_Level")],
+        [InlineKeyboardButton(text="Создать заказ", callback_data="confirm_Уровня")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="services")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
+# === ОФОРМЛЕНИЕ ЗАКАЗА В БОТЕ ===
 @dp.callback_query(F.data.startswith("confirm_"))
-async def confirm_order(callback: types.CallbackQuery):
-    service = callback.data.split("_")[1]
-    text = (
-        f"Вы выбрали: Буст {service}. Пожалуйста, подтвердите, что ваш аккаунт "
-        "соответствует требованиям (нет активных банов, уровень позволяет играть в рейтинг). Всё верно?"
-    )
-    await callback.message.edit_text(text, reply_markup=checkout_kb(service))
+async def start_other_order(callback: types.CallbackQuery, state: FSMContext):
+    service_type = callback.data.split("_")[1]
+    await state.update_data(service=service_type)
+    await callback.message.edit_text(f"Вы выбрали: Буст {service_type}.\nКак будет происходить оплата?", reply_markup=order_payment_kb())
+    await state.set_state(OrderStates.waiting_for_payment)
 
-@dp.callback_query(F.data.startswith("pay_") & ~F.data.in_({"pay_direct", "pay_funpay"}))
-async def select_payment(callback: types.CallbackQuery):
-    await callback.message.edit_text("Выберите способ оплаты:", reply_markup=payment_methods_kb())
+@dp.callback_query(OrderStates.waiting_for_payment, F.data.startswith("paym_"))
+async def process_payment_method(callback: types.CallbackQuery, state: FSMContext):
+    payment_map = {"Direct": "Владельцу", "FunPay": "FunPay", "Playerok": "Playerok"}
+    await state.update_data(payment_method=payment_map[callback.data.split("_")[1]])
+    await callback.message.edit_text("Отправьте ваш игровой ID (В Standoff 2):")
+    await state.set_state(OrderStates.waiting_for_game_id)
 
-@dp.callback_query(F.data == "pay_direct")
-async def pay_direct(callback: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Написать Владельцу", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}")],
-        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")]
+@dp.message(OrderStates.waiting_for_game_id)
+async def process_game_id(message: types.Message, state: FSMContext):
+    await state.update_data(game_id=message.text)
+    data = await state.get_data()
+    text = f"🛒 Услуга: Буст {data['service']}\n💳 Оплата: {data['payment_method']}\n🎮 ID: {data['game_id']}\n\nВсё верно?"
+    await message.answer(text, reply_markup=final_confirm_kb())
+    await state.set_state(OrderStates.waiting_for_confirmation)
+
+@dp.callback_query(OrderStates.waiting_for_confirmation, F.data == "submit_order")
+async def submit_order(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    username = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.first_name
+    admin_text = f"🔥 <b>Новый заказ!</b>\n👤 От: {username}\n🛒 Услуга: Буст {data['service']}\n🎮 ID: <code>{data['game_id']}</code>\n💳 Оплата: {data['payment_method']}"
+    admin_order_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"ord_acc_{callback.from_user.id}"),
+         InlineKeyboardButton(text="❌ Отказать", callback_data=f"ord_rej_{callback.from_user.id}")]
     ])
-    await callback.message.edit_text("Свяжитесь с владельцем для перевода средств и старта буста:", reply_markup=kb)
+    
+    for admin_id in ADMIN_IDS:
+        try: await bot.send_message(admin_id, admin_text, reply_markup=admin_order_kb, parse_mode="HTML")
+        except: pass
+            
+    await callback.message.edit_text("✅ Заказ отправлен на проверку!", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="back_to_main")]]))
+    await state.clear()
 
-@dp.callback_query(F.data == "pay_funpay")
-async def pay_funpay(callback: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Перейти на FunPay", url="https://funpay.com/твоя_ссылка")],
-        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_to_main")]
-    ])
-    text = "Оплатите заказ на нашей странице FunPay и следуйте инструкциям на сайте."
-    await callback.message.edit_text(text, reply_markup=kb)
+@dp.callback_query(F.data == "cancel_order")
+async def cancel_order(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Заказ отменен.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="В меню", callback_data="back_to_main")]]))
 
+# === ПРИНЯТИЕ/ОТКЛОНЕНИЕ ЗАКАЗА (С САЙТА ИЛИ ИЗ БОТА) ===
+@dp.callback_query(F.data.startswith("ord_acc_"))
+async def accept_order_handler(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS: return
+    client_id = int(callback.data.split("_")[2])
+    await callback.message.edit_text(f"{callback.message.html_text}\n\n<b>[✅ ЗАКАЗ ПРИНЯТ]</b>", parse_mode="HTML", reply_markup=None)
+    try:
+        if client_id != 0: # Если ID 0 - заказ с сайта без привязки Telegram ID
+            await bot.send_message(client_id, "Приветствую! Недавно вы делали заказ буста аккаунта в игре Standoff 2. Администратор полностью изучил указанную информацию и принялся за заказ! Скоро вам отпишут сотрудники команды.")
+        await callback.answer("Принято!")
+    except:
+        await callback.answer("Заказ принят, но ЛС клиента закрыты.")
+
+@dp.callback_query(F.data.startswith("ord_rej_"))
+async def reject_order_handler(callback: types.CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS: return
+    client_id = int(callback.data.split("_")[2])
+    await callback.message.edit_text(f"{callback.message.html_text}\n\n<b>[❌ ОТМЕНЕН]</b>", parse_mode="HTML", reply_markup=None)
+    try:
+        if client_id != 0:
+            await bot.send_message(client_id, "К сожалению, ваш заказ был отклонен администратором.")
+    except: pass
+
+# === ИНФОБЛОКИ ===
 @dp.callback_query(F.data == "boosters_status")
 async def show_boosters_status(callback: types.CallbackQuery):
     boosters = get_boosters()
-    text = "🕘 Текущая загруженность нашей команды:\n\n"
-    if not boosters:
-        text += "Пока нет данных о бустерах."
+    text = "🕘 Загруженность команды:\n\n" + ("\n".join([f"👤 {u} — {s}" for u, s in boosters]) if boosters else "Нет данных.")
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]]))
 
+@dp.callback_query(F.data == "rules")
+async def show_rules(callback: types.CallbackQuery):
+    text = "📜 <b>Правила:</b>\n1. Гарантируем конфиденциальность.\n2. Не заходить на аккаунт во время буста.\n3. Возврат только до начала работы."
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]]), parse_mode="HTML")
 
-    else:
-        for username, status in boosters:
-            text += f"👤 {username} — {status}\n"
-            
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить статус", callback_data="boosters_status")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
-    ])
-    await callback.message.edit_text(text, reply_markup=kb)
+@dp.callback_query(F.data == "support")
+async def show_support(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Поддержка", url=f"https://t.me/{OWNER_USERNAME.replace('@', '')}")], [InlineKeyboardButton(text="Назад", callback_data="back_to_main")]])
+    await callback.message.edit_text("Напишите нашему администратору.", reply_markup=kb)
 
 # === ПАНЕЛЬ БУСТЕРА ===
 @dp.message(Command("bpanel"))
 async def booster_panel_cmd(message: types.Message):
-    await message.answer("🤖 Панель бустера:\n\nУправляй своей занятостью кнопками ниже:", reply_markup=booster_panel_kb())
+    await message.answer("🤖 Панель бустера:", reply_markup=booster_panel_kb())
 
 @dp.callback_query(F.data.startswith("status_"))
 async def change_status(callback: types.CallbackQuery):
     new_status = "🟢 Свободен" if callback.data == "status_free" else "🔴 Занят"
     update_booster_status(callback.from_user.id, new_status)
-    await callback.answer(f"Твой статус изменен на: {new_status}", show_alert=True)
-    await callback.message.edit_text(f"🤖 Панель бустера:\n\nТвой текущий статус: {new_status}", reply_markup=booster_panel_kb())
+    await callback.message.edit_text(f"🤖 Панель бустера:\nТвой статус: {new_status}", reply_markup=booster_panel_kb())
 
 # === АДМИН ПАНЕЛЬ ===
 @dp.message(Command("admin"))
-async def admin_panel_cmd(message: types.Message):
+async def admin_panel_cmd(message: types.Message, state: FSMContext):
+    await state.clear()
     if message.from_user.id in ADMIN_IDS:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💰 Управление ценами", callback_data="admin_prices")],
-            [InlineKeyboardButton(text="👥 Управление бустерами", callback_data="admin_boosters")],
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-            [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
-        ])
-        await message.answer("👑 Добро пожаловать в Админ-панель DG | Boost!\nВыберите действие:", reply_markup=kb)
+        await message.answer("👑 Админ-панель:", reply_markup=admin_main_kb())
 
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS: return
+@dp.callback_query(F.data == "admin_prices")
+async def admin_prices_menu(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏆 Звания", callback_data="editprice_price_rank")],
+        [InlineKeyboardButton(text="🪙 Серебро", callback_data="editprice_price_silver")],
+        [InlineKeyboardButton(text="📶 Уровень", callback_data="editprice_price_level")]
+    ])
+    await callback.message.edit_text("Выберите категорию:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("editprice_"))
+async def edit_price_start(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(editing_key=callback.data.split("editprice_")[1])
+    await callback.message.edit_text("Отправьте новый прайс (можно с HTML):")
+    await state.set_state(AdminStates.waiting_for_price_text)
+
+@dp.message(AdminStates.waiting_for_price_text)
+async def save_new_price(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    set_setting(data['editing_key'], message.text)
+    await message.answer("✅ Прайс обновлен в боте!")
+    await state.clear()
+
+@dp.callback_query(F.data == "admin_boosters")
+async def admin_boosters_menu(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить", callback_data="add_booster"), InlineKeyboardButton(text="➖ Удалить", callback_data="del_booster")],
+        [InlineKeyboardButton(text="📋 Список", callback_data="list_boosters")]
+    ])
+    await callback.message.edit_text("Управление бустерами:", reply_markup=kb)
+
+@dp.callback_query(F.data == "list_boosters")
+async def list_boosters_admin(callback: types.CallbackQuery):
+    boosters = get_boosters()
+    text = "📋 Бустеры:\n" + ("\n".join([f"{u}" for u, s in boosters]) if boosters else "Пусто.")
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="admin_boosters")]]))
+
+@dp.callback_query(F.data == "add_booster")
+async def add_booster_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Отправьте ID:")
+    await state.set_state(AdminStates.waiting_for_booster_id)
+
+@dp.message(AdminStates.waiting_for_booster_id)
+async def add_booster_id(message: types.Message, state: FSMContext):
+    await state.update_data(new_booster_id=int(message.text))
+    await message.answer("Отправьте @username:")
+    await state.set_state(AdminStates.waiting_for_booster_username)
+
+@dp.message(AdminStates.waiting_for_booster_username)
+async def add_booster_username(message: types.Message, state: FSMContext):
+    data = await state.get_data()
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM users")
-    users_count = cursor.fetchone()[0]
+    cursor.execute("INSERT OR REPLACE INTO boosters (user_id, username) VALUES (?, ?)", (data['new_booster_id'], message.text))
+    conn.commit()
     conn.close()
-    await callback.answer(f"Всего пользователей в боте: {users_count}", show_alert=True)
+    await message.answer("✅ Добавлен!")
+    await state.clear()
 
-# Запуск бота
+@dp.callback_query(F.data == "del_booster")
+async def del_booster_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Отправьте ID для удаления:")
+    await state.set_state(AdminStates.waiting_for_del_booster_id)
+
+@dp.message(AdminStates.waiting_for_del_booster_id)
+async def del_booster_id(message: types.Message, state: FSMContext):
+    conn = sqlite3.connect('bot_database.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM boosters WHERE user_id = ?", (int(message.text),))
+    conn.commit()
+    conn.close()
+    await message.answer("✅ Удален!")
+    await state.clear()
+
 async def main():
     init_db()
-    
-    # Ваш ID привязан к вашей учетной записи бустера для проверки панели управления
     conn = sqlite3.connect('bot_database.db')
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO boosters (user_id, username) VALUES (1928686265, '@exp1d')")
-    cursor.execute("INSERT OR IGNORE INTO boosters (user_id, username) VALUES (2, '@BOP18rus')")
-    cursor.execute("INSERT OR IGNORE INTO boosters (user_id, username) VALUES (3, '@GIBDDBLOODY')")
     conn.commit()
     conn.close()
 
