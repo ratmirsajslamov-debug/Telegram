@@ -368,17 +368,30 @@ async def del_booster_id(message: types.Message, state: FSMContext):
     await message.answer("✅ Удален!")
     await state.clear()
 
-async def main():
-    init_db()
-    conn = sqlite3.connect('bot_database.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO boosters (user_id, username) VALUES (1928686265, '@exp1d')")
-    conn.commit()
-    conn.close()
+# === НАСТРОЙКА ВЕБХУКОВ ЧЕРЕЗ FLASK ===
+from flask import Flask, request, abort
 
-    print("Бот успешно запущен!")
-    await dp.start_polling(bot)
+# Инициализация базы данных при запуске приложения
+init_db()
+conn = sqlite3.connect('bot_database.db')
+cursor = conn.cursor()
+cursor.execute("INSERT OR IGNORE INTO boosters (user_id, username) VALUES (1928686265, '@exp1d')") #[cite: 7]
+conn.commit()
+conn.close()
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+# Создаем приложение Flask, которое ожидает WSGI-сервер
+app = Flask(__name__)
+
+@app.route('/', methods=['POST'])
+def webhook_handler():
+    # Telegram отправляет обновления в формате JSON
+    if request.headers.get('content-type') == 'application/json':
+        json_data = request.json
+        # Преобразуем JSON в объект Update, понятный aiogram
+        update = types.Update(**json_data)
+        # Передаем обновление в диспетчер бота
+        asyncio.run(dp.feed_update(bot, update))
+        return 'OK'
+    
+    # Если запрос пришел не в JSON, отклоняем его
+    abort(403)
